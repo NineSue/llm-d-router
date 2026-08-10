@@ -23,6 +23,7 @@ import (
 	"errors"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/cespare/xxhash/v2"
 	"sigs.k8s.io/controller-runtime/pkg/log"
@@ -127,15 +128,14 @@ func (b estimateBackend) produce(ctx context.Context, body *fwkrh.InferenceReque
 	// Chat and Anthropic messages fold multimodal placeholders into the stream
 	// and report them as features.
 	if body.ChatCompletions != nil {
-		raw, features := b.chatCompletionsBytes(body.ChatCompletions, mmMetadataFromContext(ctx))
-		return &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{packBytes(raw)}, MultiModalFeatures: features}, nil
+		tokens, features := b.chatCompletionsTokens(body.ChatCompletions, mmMetadataFromContext(ctx))
+		return &fwkrh.TokenizedPrompt{PerPromptTokens: [][]uint32{tokens}, MultiModalFeatures: features}, nil
 	}
 	if body.Messages != nil {
-		raw, features := b.messagesBytes(body.Messages)
-		tokens := packBytes(raw)
+		tokens, features, rawBytes := b.messagesTokens(body.Messages)
 		log.FromContext(ctx).V(logutil.DEBUG).Info("Anthropic messages prefix-cache estimation",
 			"messageCount", len(body.Messages.Messages),
-			"rawBytes", len(raw),
+			"rawBytes", rawBytes,
 			"tokenCount", len(tokens),
 			"mmFeatureCount", len(features),
 			"mmFeatures", features,
@@ -189,114 +189,124 @@ func estimateBytes(body *fwkrh.InferenceRequestBody) ([]byte, error) {
 	}
 }
 
-// chatCompletionsBytes flattens roles + text into pseudo-token bytes, folding
-// multimodal assets in on aligned boundaries. Each asset occupies N placeholder
-// pseudo-tokens (its content hash repeated N times) so it carries weight in the
-// stream, and is reported as a MultiModalFeature with its token offset and span.
-func (b estimateBackend) chatCompletionsBytes(chat *fwkrh.ChatCompletionsRequest, meta mmMetadata) ([]byte, []fwkrh.MultiModalFeature) {
-	var out []byte
-	var features []fwkrh.MultiModalFeature
-	if len(chat.Tools) > 0 {
-		if raw, err := json.Marshal(chat.Tools); err == nil {
-			out = append(out, raw...)
-		}
-	}
-	for _, msg := range chat.Messages {
-		out, features = b.appendChatMessage(out, features, msg, meta)
-	}
-	return out, features
+// estimatedTokenStream keeps text packing and multimodal placeholder packing
+// separate so UTF-8 padding cannot shift feature offsets or reinterpret hash bytes.
+type estimatedTokenStream struct {
+	tokens   []uint32
+	text     []byte
+	features []fwkrh.MultiModalFeature
+	rawBytes int
 }
 
-// appendChatMessage flattens a single chat-completions message into the byte
-// stream, recording multimodal placeholders on aligned boundaries.
-func (b estimateBackend) appendChatMessage(out []byte, features []fwkrh.MultiModalFeature, msg fwkrh.Message, meta mmMetadata) ([]byte, []fwkrh.MultiModalFeature) {
-	if msg.Role != "" {
-		out = append(out, []byte(msg.Role)...)
-	}
-	if msg.Content.Raw != "" {
-		out = append(out, []byte(msg.Content.Raw)...)
-		return out, features
-	}
-	for _, block := range msg.Content.Structured {
-		switch block.Type {
-		case blockTypeText:
-			out = append(out, []byte(block.Text)...)
-		case "image_url":
-			out, features = appendMMAsset(out, features, fwkrh.ModalityImage, block.ImageURL.URL, b.img.placeholderCount(block.ImageURL.URL))
-		case "video_url":
-			out, features = appendMMAsset(out, features, fwkrh.ModalityVideo, block.VideoURL.URL, b.vid.placeholderCount(meta.video))
-		case "input_audio", "audio_url":
-			data := block.InputAudio.Data + block.InputAudio.Format
-			out, features = appendMMAsset(out, features, fwkrh.ModalityAudio, data, assetPlaceholderCount(len(data)))
-		}
-	}
-	return out, features
+func (s *estimatedTokenStream) appendText(raw []byte) {
+	s.text = append(s.text, raw...)
+	s.rawBytes += len(raw)
 }
 
-// messagesBytes flattens an Anthropic /v1/messages request into pseudo-token
-// bytes.
-func (b estimateBackend) messagesBytes(req *fwkrh.MessagesRequest) ([]byte, []fwkrh.MultiModalFeature) {
-	var out []byte
-	var features []fwkrh.MultiModalFeature
-	if len(req.Tools) > 0 {
-		if raw, err := json.Marshal(req.Tools); err == nil {
-			out = append(out, raw...)
-		}
-	}
-	// The system field accepts only text -- a string or an array of text blocks.
-	// See https://docs.anthropic.com/en/api/messages#body-system.
-	if req.System.Raw != "" {
-		out = append(out, []byte(req.System.Raw)...)
-	} else {
-		for _, block := range req.System.Structured {
-			if block.Type == blockTypeText {
-				out = append(out, []byte(block.Text)...)
-			}
-		}
-	}
-	for _, msg := range req.Messages {
-		if msg.Role != "" {
-			out = append(out, []byte(msg.Role)...)
-		}
-		if msg.Content.Raw != "" {
-			out = append(out, []byte(msg.Content.Raw)...)
-			continue
-		}
-		for _, block := range msg.Content.Structured {
-			switch block.Type {
-			case blockTypeText:
-				out = append(out, []byte(block.Text)...)
-			case "image":
-				if content, count := b.img.placeholderForAnthropicImage(block.Source); content != "" {
-					out, features = appendMMAsset(out, features, fwkrh.ModalityImage, content, count)
-				}
-			}
-		}
-	}
-	return out, features
+func (s *estimatedTokenStream) flushText() {
+	s.tokens = append(s.tokens, packBytes(s.text)...)
+	s.text = s.text[:0]
 }
 
-// appendMMAsset aligns out to a token boundary, appends count placeholder
-// pseudo-tokens derived from a stable content hash, and records the matching
-// feature under modality so labels agree with the vllm backend.
-func appendMMAsset(out []byte, features []fwkrh.MultiModalFeature, modality fwkrh.Modality, content string, count int) ([]byte, []fwkrh.MultiModalFeature) {
-	out = align(out)
-	offset := len(out) / bytesPerToken
-
+func (s *estimatedTokenStream) appendMMAsset(modality fwkrh.Modality, content string, count int) {
+	s.flushText()
+	offset := len(s.tokens)
 	sum := xxhash.Sum64String(content)
-	token := make([]byte, bytesPerToken)
-	binary.LittleEndian.PutUint32(token, uint32(sum))
 	for i := 0; i < count; i++ {
-		out = append(out, token...)
+		s.tokens = append(s.tokens, uint32(sum))
 	}
-
-	features = append(features, fwkrh.MultiModalFeature{
+	s.rawBytes += count * bytesPerToken
+	s.features = append(s.features, fwkrh.MultiModalFeature{
 		Modality: modality,
 		Hash:     strconv.FormatUint(sum, 16),
 		Offset:   offset,
 		Length:   count,
 	})
-	return out, features
+}
+
+func (s *estimatedTokenStream) finish() ([]uint32, []fwkrh.MultiModalFeature, int) {
+	s.flushText()
+	return s.tokens, s.features, s.rawBytes
+}
+
+// chatCompletionsTokens flattens roles + text into pseudo-tokens and inserts
+// multimodal placeholders on token boundaries.
+func (b estimateBackend) chatCompletionsTokens(chat *fwkrh.ChatCompletionsRequest, meta mmMetadata) ([]uint32, []fwkrh.MultiModalFeature) {
+	var stream estimatedTokenStream
+	if len(chat.Tools) > 0 {
+		if raw, err := json.Marshal(chat.Tools); err == nil {
+			stream.appendText(raw)
+		}
+	}
+	for _, msg := range chat.Messages {
+		b.appendChatMessage(&stream, msg, meta)
+	}
+	tokens, features, _ := stream.finish()
+	return tokens, features
+}
+
+func (b estimateBackend) appendChatMessage(stream *estimatedTokenStream, msg fwkrh.Message, meta mmMetadata) {
+	if msg.Role != "" {
+		stream.appendText([]byte(msg.Role))
+	}
+	if msg.Content.Raw != "" {
+		stream.appendText([]byte(msg.Content.Raw))
+		return
+	}
+	for _, block := range msg.Content.Structured {
+		switch block.Type {
+		case blockTypeText:
+			stream.appendText([]byte(block.Text))
+		case "image_url":
+			stream.appendMMAsset(fwkrh.ModalityImage, block.ImageURL.URL, b.img.placeholderCount(block.ImageURL.URL))
+		case "video_url":
+			stream.appendMMAsset(fwkrh.ModalityVideo, block.VideoURL.URL, b.vid.placeholderCount(meta.video))
+		case "input_audio", "audio_url":
+			data := block.InputAudio.Data + block.InputAudio.Format
+			stream.appendMMAsset(fwkrh.ModalityAudio, data, assetPlaceholderCount(len(data)))
+		}
+	}
+}
+
+// messagesTokens flattens an Anthropic /v1/messages request into pseudo-tokens.
+func (b estimateBackend) messagesTokens(req *fwkrh.MessagesRequest) ([]uint32, []fwkrh.MultiModalFeature, int) {
+	var stream estimatedTokenStream
+	if len(req.Tools) > 0 {
+		if raw, err := json.Marshal(req.Tools); err == nil {
+			stream.appendText(raw)
+		}
+	}
+	// The system field accepts only text -- a string or an array of text blocks.
+	// See https://docs.anthropic.com/en/api/messages#body-system.
+	if req.System.Raw != "" {
+		stream.appendText([]byte(req.System.Raw))
+	} else {
+		for _, block := range req.System.Structured {
+			if block.Type == blockTypeText {
+				stream.appendText([]byte(block.Text))
+			}
+		}
+	}
+	for _, msg := range req.Messages {
+		if msg.Role != "" {
+			stream.appendText([]byte(msg.Role))
+		}
+		if msg.Content.Raw != "" {
+			stream.appendText([]byte(msg.Content.Raw))
+			continue
+		}
+		for _, block := range msg.Content.Structured {
+			switch block.Type {
+			case blockTypeText:
+				stream.appendText([]byte(block.Text))
+			case "image":
+				if content, count := b.img.placeholderForAnthropicImage(block.Source); content != "" {
+					stream.appendMMAsset(fwkrh.ModalityImage, content, count)
+				}
+			}
+		}
+	}
+	return stream.finish()
 }
 
 // assetPlaceholderCount derives a deterministic placeholder count (>= 1) from an
@@ -308,21 +318,11 @@ func assetPlaceholderCount(dataLen int) int {
 	return 1
 }
 
-// utf8CharSize returns the byte length of a UTF-8 character given its first byte.
-// Invalid and continuation bytes fall back to 1.
-func utf8CharSize(firstByte byte) int {
-	switch {
-	case firstByte&0x80 == 0x00:
-		return 1
-	case firstByte&0xE0 == 0xC0:
-		return 2
-	case firstByte&0xF0 == 0xE0:
-		return 3
-	case firstByte&0xF8 == 0xF0:
-		return 4
-	default:
-		return 1 // invalid UTF-8 continuation byte, treat as single byte
-	}
+// utf8CharSize returns the next valid UTF-8 character's byte length. Invalid
+// and truncated encodings consume one byte so packing always makes progress.
+func utf8CharSize(raw []byte) int {
+	_, size := utf8.DecodeRune(raw)
+	return size
 }
 
 // packBytes packs bytes into little-endian uint32 pseudo-tokens respecting
@@ -336,10 +336,7 @@ func packBytes(raw []byte) []uint32 {
 	pos := 0
 
 	for len(raw) > 0 {
-		size := utf8CharSize(raw[0])
-		if size > len(raw) {
-			size = 1 // truncated bytes or non-UTF-8 (e.g. MM placeholder hashes)
-		}
+		size := utf8CharSize(raw)
 		if pos+size > bytesPerToken {
 			out = append(out, binary.LittleEndian.Uint32(slot[:]))
 			slot = [bytesPerToken]byte{}

@@ -772,10 +772,39 @@ func TestPackBytes_Invalid_UTF8(t *testing.T) {
 	assert.NotEmpty(t, tokens, "invalid UTF-8 must not crash and still produce tokens")
 }
 
+func TestPackBytes_InvalidUTF8PreservesBytePacking(t *testing.T) {
+	raw := []byte{'A', 'B', 'C', 0xE2, 'D', 'E'}
+	aligned := align(append([]byte(nil), raw...))
+	expected := make([]uint32, len(aligned)/bytesPerToken)
+	for i := range expected {
+		expected[i] = binary.LittleEndian.Uint32(aligned[i*bytesPerToken:])
+	}
+
+	assert.Equal(t, expected, packBytes(raw))
+}
+
 // TestPackBytes_Empty covers nil and zero-length inputs.
 func TestPackBytes_Empty(t *testing.T) {
 	assert.Nil(t, packBytes(nil), "nil input must return nil")
 	assert.Nil(t, packBytes([]byte{}), "empty input must return nil")
+}
+
+func TestEstimatedTokenStream_MultimodalOffsetAfterUTF8Text(t *testing.T) {
+	const content = "image payload"
+	var stream estimatedTokenStream
+	stream.appendText([]byte("ab路"))
+	stream.appendMMAsset(fwkrh.ModalityImage, content, 1)
+
+	tokens, features, _ := stream.finish()
+	require.Len(t, features, 1)
+	feature := features[0]
+	require.Less(t, feature.Offset, len(tokens))
+	assert.Equal(
+		t,
+		uint32(xxhash.Sum64String(content)),
+		tokens[feature.Offset],
+		"feature offset must point to its placeholder token",
+	)
 }
 
 // assertNoCharSplit verifies every multi-byte UTF-8 character is wholly contained
@@ -791,7 +820,7 @@ func assertNoCharSplit(t *testing.T, tokens []uint32) {
 		}
 		used := 0
 		for i := 0; i < bytesPerToken; {
-			size := utf8CharSize(b[i])
+			size := utf8CharSize(b[i:])
 			if used+size > bytesPerToken && size < bytesPerToken {
 				t.Fatalf("character split across slot boundary (token=%08x, slot byte %d)", tok, i)
 			}
